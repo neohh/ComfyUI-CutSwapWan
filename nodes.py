@@ -903,16 +903,45 @@ FACE_PREP_REACTOR_MODEL = "inswapper_128.onnx"
 # Separate fast profile (Af): smaller window + lighter detector. Swap stays VRAM-safe.
 FAST_WAN_MAX_SIDE = 640
 FAST_REACTOR_DETECT = "retinaface_mobile0.25"
-# RTX 5080 16GB + Wan2.2 Animate 14B fp8. 768²/swap20 OK; 640²/swap10 CUDA-crashed at sample.
+# RTX 5080 16GB + Wan2.2 Animate 14B. FP8 (~17G) needs heavy blockswap; Q4 GGUF (~12G) fits better.
 FACE_SAFE_MAX_SIDE = 768
 FACE_SAFE_MAX_PIXELS = 768 * 768
 FACE_BLOCKS_MIN = 20
 FACE_BLOCKS_MAX = 28
 FACE_PREFETCH_SAFE = 1
+WAN_ANIMATE_FP8 = "Wan2_2-Animate-14B_fp8_scaled_e4m3fn_KJ_v2.safetensors"
+WAN_ANIMATE_Q4 = "Wan2_2_Animate_14B_Q4_K_M.gguf"
+# Q4 smoke: smaller window; 16GB still needs heavy blockswap (5080 hangs at swap~6–10).
+GGUF_WAN_MAX_SIDE = 512
+GGUF_WAN_MAX_PIXELS = 512 * 512
+# Known-good 5080 recipe for stuck Sampling@0%: swap ~40, non_blocking off.
+FACE_BLOCKS_MIN_GGUF = 36
+FACE_BLOCKS_MAX_GGUF = 40
+
+
+def _wan_animate_model_name(seg: dict | None = None) -> str:
+    """Prefer Q4 GGUF on 16GB cards when present; allow per-seg override."""
+    s = seg or {}
+    override = str(s.get("wan_model") or "").strip()
+    if override:
+        return override
+    root = Path(folder_paths.models_dir) / "diffusion_models"
+    if (root / WAN_ANIMATE_Q4).exists():
+        return WAN_ANIMATE_Q4
+    return WAN_ANIMATE_FP8
+
+
+def _is_gguf_model(name: str) -> bool:
+    return str(name or "").lower().endswith(".gguf")
 
 
 def _is_reactor_prep(val: str | None) -> bool:
     return str(val or "").strip().lower() in {"reactor", "a", "swap", "reactor_fast", "af", "fast_a"}
+
+
+def _is_polish_prep(val: str | None) -> bool:
+    """SwapPolish: ReActor + light shape/hair — no Wan redraw."""
+    return str(val or "").strip().lower() in {"polish", "p", "swap_polish", "polish_a"}
 
 
 def _is_fast_profile(seg: dict | None) -> bool:
@@ -922,14 +951,18 @@ def _is_fast_profile(seg: dict | None) -> bool:
     return str(s.get("face_images_prep") or "").strip().lower() in {"reactor_fast", "af", "fast_a"}
 
 
-def _face_block_swap_for_size(width: int, height: int, n_frames: int = 49) -> tuple[int, int]:
+def _face_block_swap_for_size(
+    width: int, height: int, n_frames: int = 49, *, gguf: bool = False
+) -> tuple[int, int]:
     """blocks_to_swap + prefetch so 14B Animate stays inside ~16GB for any clip size.
 
-    More pixels / longer clips → more blocks on CPU. Never go below FACE_BLOCKS_MIN:
-    under-swapping was what blew Af (illegal memory access at Sampling start).
+    More pixels / longer clips → more blocks on CPU. FP8 never goes below FACE_BLOCKS_MIN:
+    under-swapping blew Af (illegal memory access at Sampling start). Q4 can run lighter.
     """
     px = max(1, int(width) * int(height))
-    blocks = FACE_BLOCKS_MIN
+    lo = FACE_BLOCKS_MIN_GGUF if gguf else FACE_BLOCKS_MIN
+    hi = FACE_BLOCKS_MAX_GGUF if gguf else FACE_BLOCKS_MAX
+    blocks = lo
     if px > 520_000:
         blocks += 2
     if px > 650_000:
@@ -938,7 +971,7 @@ def _face_block_swap_for_size(width: int, height: int, n_frames: int = 49) -> tu
         blocks += 2
     if int(n_frames) >= 161:
         blocks += 2
-    blocks = max(FACE_BLOCKS_MIN, min(FACE_BLOCKS_MAX, blocks))
+    blocks = max(lo, min(hi, blocks))
     return blocks, FACE_PREFETCH_SAFE
 
 
@@ -946,17 +979,30 @@ def _apply_face_vram_guard(wf: dict, width: int, height: int, n_frames: int, seg
     """Force BlockSwap onto a known-safe budget for face mode (any video)."""
     if "15" not in wf:
         return
-    blocks, prefetch = _face_block_swap_for_size(width, height, n_frames)
-    if seg is not None and seg.get("blocks_to_swap") is not None:
+    model_name = ""
+    if "16" in wf:
+        model_name = str(wf["16"].get("inputs", {}).get("model") or "")
+    gguf = _is_gguf_model(model_name) or _is_gguf_model(str((seg or {}).get("wan_model") or ""))
+    blocks, prefetch = _face_block_swap_for_size(width, height, n_frames, gguf=gguf)
+    if seg is not None and seg.get("blocks_to_swap") is not None and not gguf:
+        # Old FP8 cuts.json floors must not force heavy swap onto Q4 GGUF.
         blocks = max(blocks, int(seg["blocks_to_swap"]))
+    if seg is not None and seg.get("force_blocks_to_swap") is not None:
+        blocks = int(seg["force_blocks_to_swap"])
     if seg is not None and seg.get("prefetch_blocks") is not None:
         prefetch = int(seg["prefetch_blocks"])
     wf["15"]["inputs"]["blocks_to_swap"] = int(blocks)
-    wf["15"]["inputs"]["prefetch_blocks"] = int(prefetch)
-    wf["15"]["inputs"]["use_non_blocking"] = True
+    # GGUF/5080: non_blocking + low swap → sampler stuck at 0% with VRAM pegged.
+    if gguf:
+        prefetch = 0
+        wf["15"]["inputs"]["use_non_blocking"] = False
+        wf["15"]["inputs"]["prefetch_blocks"] = 0
+    else:
+        wf["15"]["inputs"]["prefetch_blocks"] = int(prefetch)
+        wf["15"]["inputs"]["use_non_blocking"] = True
     if seg is not None:
         seg["blocks_to_swap"] = int(blocks)
-        seg["prefetch_blocks"] = int(prefetch)
+        seg["prefetch_blocks"] = int(0 if gguf else prefetch)
 
 
 def _input_video(path_name: str) -> Path:
@@ -1292,7 +1338,12 @@ def _prepare_seg_wan_crop(
     # Representative box is the chosen frame. Every frame uses its own tracked window.
     x0, y0, x1, y1 = tracks[ref_index]
     cw, ch = x1 - x0, y1 - y0
-    if _is_fast_profile(seg):
+    if _is_gguf_model(_wan_animate_model_name(seg)):
+        # Q4 smoke / 16GB: keep latent window small so first sample step stays alive.
+        wan_w, wan_h = _wan_fit_size(
+            cw, ch, max_side=GGUF_WAN_MAX_SIDE, max_pixels=GGUF_WAN_MAX_PIXELS
+        )
+    elif _is_fast_profile(seg):
         # Fast test: smaller window only. Block-swap budget is applied later and stays safe.
         wan_w, wan_h = _wan_fit_size(
             cw, ch, max_side=FAST_WAN_MAX_SIDE, max_pixels=FAST_WAN_MAX_SIDE * FAST_WAN_MAX_SIDE
@@ -2509,6 +2560,15 @@ def _build_seg_workflow(
     if "19" in wf and "seed" in wf["19"].get("inputs", {}):
         wf["19"]["inputs"]["seed"] = seed
     # Option A: swap master face onto PoseAndFaceDetection crops, keep eyelid/mouth motion.
+    # Prefer lighter Q4 Animate on 16GB when available.
+    model_name = _wan_animate_model_name(seg)
+    if "16" in wf:
+        wf["16"]["inputs"]["model"] = model_name
+        if _is_gguf_model(model_name):
+            wf["16"]["inputs"]["quantization"] = "disabled"
+    if _is_gguf_model(model_name) and "14" in wf:
+        # GGUF forbids merge_loras=True.
+        wf["14"]["inputs"]["merge_loras"] = False
     if mode == "face" and _is_reactor_prep(seg.get("face_images_prep")):
         fast = _is_fast_profile(seg)
         detect = FAST_REACTOR_DETECT if fast else "retinaface_resnet50"
@@ -2536,14 +2596,20 @@ def _build_seg_workflow(
             wf["17"]["inputs"]["face_strength"] = float(seg.get("face_strength", 1.0))
     if mode == "face":
         _apply_face_vram_guard(wf, w, h, n, seg)
+        if _is_gguf_model(model_name) and "17" in wf:
+            # Free VRAM between embed prep and sampler on 16GB.
+            wf["17"]["inputs"]["force_offload"] = True
+    # Minimal-time tests: allow fewer distill steps.
+    if "19" in wf and seg.get("wan_steps") is not None:
+        wf["19"]["inputs"]["steps"] = int(seg["wan_steps"])
     if seg.get("test_preview"):
         prep = str(seg.get("face_images_prep") or "").lower()
         if _is_fast_profile(seg):
             tag = "Af"
         elif _is_reactor_prep(prep):
-            tag = "A"
+            tag = "AQ4" if _is_gguf_model(model_name) else "A"
         else:
-            tag = ""
+            tag = "Q4" if _is_gguf_model(model_name) else ""
         prefix = f"cut_video_face_swapper/{cfg['name']}/preview/{sid}{('_' + tag) if tag else ''}"
     else:
         prefix = f"cut_video_face_swapper/{cfg['name']}/parts/{sid}"
@@ -2793,7 +2859,7 @@ def _run_all_segments(
             seg_run = _clip_seg_for_test(seg, float(cfg.get("fps") or 24), float(test_seconds))
         prep = str(face_images_prep or "").strip()
         speed = str(speed_profile or "").strip()
-        if prep or speed:
+        if prep or speed or (test_seconds and float(test_seconds) > 0):
             if seg_run is seg:
                 seg_run = dict(seg)
             if prep:
@@ -2802,11 +2868,47 @@ def _run_all_segments(
                 seg_run["speed_profile"] = speed
             elif _is_fast_profile(seg_run):
                 seg_run["speed_profile"] = "fast"
+            # Short smoke tests: 6 distill steps is enough to judge Q4 speed/quality.
+            if test_seconds and float(test_seconds) <= 1.0:
+                seg_run.setdefault("wan_steps", 6)
         if only_missing_wan and not seg_run.get("test_preview") and _seg_has_part(job, job_name, sid):
             # An old Animate part must not block the VACE graph.
             if not (mode == "vace" and not _output_part_is_vace(job_name, sid)):
                 skipped.append(f"{sid}:already_has_part")
                 continue
+        # SwapPolish: local ReActor + shape/hair, no Wan queue.
+        if _is_polish_prep(seg_run.get("face_images_prep")) or _is_polish_prep(prep):
+            try:
+                from .swap_polish import run_swap_polish_segment
+
+                driver_p = _input_video(cfg["comfy_driver"])
+                mask_p = _input_video(cfg["comfy_mask_rect"])
+                model_p = Path(folder_paths.models_dir) / "insightface" / FACE_PREP_REACTOR_MODEL
+                if not model_p.exists():
+                    model_p = Path(folder_paths.models_dir) / "insightface" / "models" / FACE_PREP_REACTOR_MODEL
+                out_preview = (
+                    Path(folder_paths.get_output_directory())
+                    / "cut_video_face_swapper"
+                    / job_name
+                    / "preview"
+                )
+                meta = run_swap_polish_segment(
+                    job=job,
+                    job_name=job_name,
+                    seg=seg_run,
+                    driver_path=driver_p,
+                    mask_path=mask_p,
+                    master_path=master,
+                    model_path=model_p,
+                    fps=float(cfg.get("fps") or 24),
+                    shape_strength=float(seg_run.get("polish_shape", 0.18)),
+                    hair_strength=float(seg_run.get("polish_hair", 0.95)),
+                    output_root=out_preview,
+                )
+                queued_ids.append(f"{sid}:polish:{meta.get('mp4')}")
+            except Exception as e:
+                skipped.append(f"{sid}:polish_fail:{e}")
+            continue
         seed_i = 231 if mode == "vace" else int(seed) + i
         wf_path = _build_seg_workflow(
             job, cfg, seg_run, seed=seed_i, pad_percent=float(pad_percent)

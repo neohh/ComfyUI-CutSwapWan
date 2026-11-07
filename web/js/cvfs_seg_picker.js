@@ -138,9 +138,11 @@ function openScenes(node) {
   testABtn.textContent = "Тест A (swap mimic)";
   const testAfBtn = document.createElement("button");
   testAfBtn.textContent = "Тест Af (fast)";
+  const testPBtn = document.createElement("button");
+  testPBtn.textContent = "Тест P (polish)";
   const cancel = document.createElement("button");
   cancel.textContent = "Закрыть";
-  actions.append(testBtn, testABtn, testAfBtn, one, all, checkedBtn, cancel);
+  actions.append(testBtn, testABtn, testAfBtn, testPBtn, one, all, checkedBtn, cancel);
   panel.appendChild(actions);
   overlay.appendChild(panel);
   document.body.appendChild(overlay);
@@ -186,6 +188,8 @@ function openScenes(node) {
     let note = "Смотри очередь Comfy. В конце соберётся final.mp4.";
     if (testSeconds && speedProfile === "fast") {
       note = "Тест Af: swap mimic + окно ~640, VRAM-safe swap≥20. Файл preview/XX_Af_*.mp4.";
+    } else if (facePrep === "polish" || facePrep === "p" || facePrep === "swap_polish") {
+      note = "Тест P (SwapPolish): ReActor + лёгкая форма/волосы, без Wan. Файл preview/XX_P_*.mp4.";
     } else if (testSeconds && facePrep) {
       note = "Тест A: ReActor на face_images → Wan. Файл preview/XX_A_*.mp4. Финал не собирается.";
     } else if (testSeconds) {
@@ -251,6 +255,15 @@ function openScenes(node) {
       assemble: false,
       face_images_prep: "reactor_fast",
       speed_profile: "fast",
+    });
+  };
+  testPBtn.onclick = () => {
+    const seg = scenes[selected];
+    if (!seg) return;
+    queue([seg.seg_index], `тест P polish SEG${seg.seg_id}`, {
+      test_seconds: 2,
+      assemble: false,
+      face_images_prep: "polish",
     });
   };
   one.onclick = () => {
