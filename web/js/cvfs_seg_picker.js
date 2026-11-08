@@ -19,7 +19,6 @@ function findByTitleIncludes(substr) {
  */
 async function applySegToWanNodes(jobName, segIndex, padPercent, wanMode) {
   const pad = padPercent ?? 20;
-  const mode = wanMode || "face";
   const resp = await api.fetchApi(
     `/cvfs/seg_info?job=${encodeURIComponent(jobName)}&seg=${encodeURIComponent(segIndex)}&pad=${encodeURIComponent(pad)}`
   );
@@ -110,6 +109,28 @@ function masterUrl(job, segId) {
   return api.apiURL(`/view?${q.toString()}`);
 }
 
+function openWork(node, scenes, selected) {
+  const job = node.widgets?.find((w) => w.name === "job_name")?.value || "";
+  const pad = node.widgets?.find((w) => w.name === "pad_percent")?.value ?? 20;
+  const seg = scenes[selected];
+  if (!seg) return;
+  setWidget(node, "seg_index", seg.seg_index);
+  if (typeof window.cvfsOpenMatte !== "function") {
+    alert("Окно «Одна сцена» не загрузилось. Обнови страницу Comfy (Ctrl+F5).");
+    return;
+  }
+  window.cvfsOpenMatte({
+    job,
+    segIndex: seg.seg_index,
+    segId: seg.seg_id,
+    pad,
+    scenes,
+  });
+}
+
+/**
+ * Multi-scene overview + pool assemble. Per-scene work is «Одна сцена».
+ */
 function openScenes(node) {
   const job = node.widgets?.find((w) => w.name === "job_name")?.value || "";
   const pad = node.widgets?.find((w) => w.name === "pad_percent")?.value ?? 20;
@@ -120,29 +141,21 @@ function openScenes(node) {
   panel.style.cssText =
     "background:#1e1e1e;color:#ddd;padding:16px;border-radius:10px;max-width:920px;width:94%;max-height:88vh;overflow:auto;font:14px sans-serif;";
   panel.innerHTML =
-    "<b>Сцены</b>" +
-    "<div style='opacity:.75;font-size:12px;margin-top:4px'>Выбери сцену по мастеркадру. Режим из «Порядок и режимы». Рендер в очередь, потом финал.</div>" +
+    "<b>Сцены и пул</b>" +
+    "<div style='opacity:.75;font-size:12px;margin-top:4px'>Все сцены видео. Открой любую — тест и выбор идут по одной, готовые копятся в пуле.</div>" +
     "<div class='cvfs-dirs' style='opacity:.8;font-size:12px;margin-top:8px;white-space:pre-wrap'></div>" +
     "<div class='cvfs-scenes' style='margin-top:10px'></div>";
   const actions = document.createElement("div");
   actions.style.cssText = "margin-top:12px;display:flex;gap:8px;flex-wrap:wrap;";
-  const one = document.createElement("button");
-  one.textContent = "Рендер выбранную";
-  const all = document.createElement("button");
-  all.textContent = "Перерендерить все с нуля";
-  const checkedBtn = document.createElement("button");
-  checkedBtn.textContent = "Перерендерить отмеченные";
-  const testBtn = document.createElement("button");
-  testBtn.textContent = "Тест 2 сек";
-  const testABtn = document.createElement("button");
-  testABtn.textContent = "Тест A (swap mimic)";
-  const testAfBtn = document.createElement("button");
-  testAfBtn.textContent = "Тест Af (fast)";
-  const testPBtn = document.createElement("button");
-  testPBtn.textContent = "Тест P (polish)";
+  const workBtn = document.createElement("button");
+  workBtn.textContent = "Открыть сцену";
+  workBtn.style.cssText = "padding:10px 14px;background:#3d6ea8;color:#fff;border:0;border-radius:8px;cursor:pointer;";
+  const assembleBtn = document.createElement("button");
+  assembleBtn.textContent = "Склеить финал из пула";
+  assembleBtn.style.cssText = "padding:10px 14px;background:#2f7d4a;color:#fff;border:0;border-radius:8px;cursor:pointer;";
   const cancel = document.createElement("button");
   cancel.textContent = "Закрыть";
-  actions.append(testBtn, testABtn, testAfBtn, testPBtn, one, all, checkedBtn, cancel);
+  actions.append(workBtn, assembleBtn, cancel);
   panel.appendChild(actions);
   overlay.appendChild(panel);
   document.body.appendChild(overlay);
@@ -160,43 +173,11 @@ function openScenes(node) {
     return mode === "vace" ? "Без лица — VACE" : "Лицо — Wan";
   }
 
-  async function queue(indices, title, extra) {
-    const testSeconds = Number(extra?.test_seconds) || 0;
-    const facePrep = String(extra?.face_images_prep || "");
-    const speedProfile = String(extra?.speed_profile || "");
-    const resp = await api.fetchApi("/cvfs/run_all", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        job_name: job,
-        pad_percent: pad,
-        seed: 210,
-        only_missing_wan: false,
-        queue_assemble_after: !testSeconds && extra?.assemble !== false,
-        seg_indices: indices,
-        test_seconds: testSeconds,
-        face_images_prep: facePrep,
-        speed_profile: speedProfile,
-      }),
-    });
-    const data = await resp.json();
-    if (!resp.ok || data.error) {
-      alert(data.error || "не удалось поставить в очередь");
-      return;
-    }
-    node.title = `[Z2] SEG picker — ${title}`;
-    let note = "Смотри очередь Comfy. В конце соберётся final.mp4.";
-    if (testSeconds && speedProfile === "fast") {
-      note = "Тест Af: swap mimic + окно ~640, VRAM-safe swap≥20. Файл preview/XX_Af_*.mp4.";
-    } else if (facePrep === "polish" || facePrep === "p" || facePrep === "swap_polish") {
-      note = "Тест P (SwapPolish): ReActor + лёгкая форма/волосы, без Wan. Файл preview/XX_P_*.mp4.";
-    } else if (testSeconds && facePrep) {
-      note = "Тест A: ReActor на face_images → Wan. Файл preview/XX_A_*.mp4. Финал не собирается.";
-    } else if (testSeconds) {
-      note = "Короткий кусок вокруг выбранного кадра. Финал не собирается.";
-    }
-    alert(`${title}\n${note}`);
-    overlay.remove();
+  function statusText(seg) {
+    if (seg.in_pool) return "в пуле";
+    if (seg.has_test) return "есть тест";
+    if (seg.full_exists || seg.part_exists) return "есть рендер";
+    return "не начата";
   }
 
   function render() {
@@ -207,82 +188,45 @@ function openScenes(node) {
         "display:flex;gap:10px;align-items:center;padding:6px;margin-bottom:6px;background:#2a2a2a;border-radius:6px;cursor:pointer;border:2px solid " +
         (i === selected ? "#6af" : "transparent") +
         ";";
-      const box = document.createElement("input");
-      box.type = "checkbox";
-      box.checked = !!seg.checked;
-      box.onclick = (e) => e.stopPropagation();
-      box.onchange = () => {
-        seg.checked = box.checked;
-      };
       const img = document.createElement("img");
       img.alt = "";
       img.style.cssText = "width:160px;height:90px;object-fit:cover;background:#000;";
       if (seg.master_exists) img.src = masterUrl(job, seg.seg_id);
-      const done = seg.full_exists || seg.part_exists ? "готово" : "нет рендера";
       const text = document.createElement("div");
       text.innerHTML =
         `<b>SEG${seg.seg_id}</b> <span style="opacity:.7">${seg.frames || ""}</span><br>` +
         `<span style="opacity:.85">${modeLabel(seg.wan_mode)}</span><br>` +
-        `<span style="opacity:.7">${done}</span>`;
-      row.append(box, img, text);
+        `<span style="opacity:.7">${statusText(seg)}${seg.choice ? " · маска " + seg.choice : ""}</span>`;
+      row.append(img, text);
       row.onclick = () => {
         selected = i;
         render();
+      };
+      row.ondblclick = () => {
+        selected = i;
+        openWork(node, scenes, selected);
+        overlay.remove();
       };
       listEl.appendChild(row);
     });
   }
 
-  testBtn.onclick = () => {
-    const seg = scenes[selected];
-    if (!seg) return;
-    queue([seg.seg_index], `тест 2 сек SEG${seg.seg_id}`, { test_seconds: 2, assemble: false });
+  workBtn.onclick = () => {
+    openWork(node, scenes, selected);
+    overlay.remove();
   };
-  testABtn.onclick = () => {
-    const seg = scenes[selected];
-    if (!seg) return;
-    queue([seg.seg_index], `тест A swap-mimic SEG${seg.seg_id}`, {
-      test_seconds: 2,
-      assemble: false,
-      face_images_prep: "reactor",
+  assembleBtn.onclick = async () => {
+    const resp = await api.fetchApi("/cvfs/pool_assemble", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ job_name: job }),
     });
-  };
-  testAfBtn.onclick = () => {
-    const seg = scenes[selected];
-    if (!seg) return;
-    queue([seg.seg_index], `тест Af fast SEG${seg.seg_id}`, {
-      test_seconds: 2,
-      assemble: false,
-      face_images_prep: "reactor_fast",
-      speed_profile: "fast",
-    });
-  };
-  testPBtn.onclick = () => {
-    const seg = scenes[selected];
-    if (!seg) return;
-    queue([seg.seg_index], `тест P polish SEG${seg.seg_id}`, {
-      test_seconds: 2,
-      assemble: false,
-      face_images_prep: "polish",
-    });
-  };
-  one.onclick = () => {
-    const seg = scenes[selected];
-    if (!seg) return;
-    queue([seg.seg_index], `рендер SEG${seg.seg_id}`);
-  };
-  all.onclick = () => {
-    if (!confirm("Перерендерить все сцены с нуля и собрать финал? Старые куски не используются.")) return;
-    queue(null, "все сцены с нуля");
-  };
-  checkedBtn.onclick = () => {
-    const ids = scenes.filter((s) => s.checked).map((s) => s.seg_index);
-    if (!ids.length) {
-      alert("Отметь галочками хотя бы одну сцену.");
+    const data = await resp.json();
+    if (!resp.ok || data.error) {
+      alert(data.error || "склейка не вышла");
       return;
     }
-    const names = scenes.filter((s) => s.checked).map((s) => `SEG${s.seg_id}`).join(", ");
-    queue(ids, `отмеченные: ${names}`);
+    alert(`Финал: ${data.final}\nИз пула: ${(data.used || []).map((s) => "SEG" + s).join(", ") || "пусто"}`);
   };
 
   if (!job) {
@@ -293,19 +237,32 @@ function openScenes(node) {
   Promise.all([
     api.fetchApi(`/cvfs/seg_modes?job=${encodeURIComponent(job)}`).then((r) => r.json()),
     api.fetchApi(`/cvfs/job_results?job=${encodeURIComponent(job)}`).then((r) => r.json()),
+    api.fetchApi(`/cvfs/pool?job=${encodeURIComponent(job)}`).then((r) => r.json()),
   ])
-    .then(([modesData, resultsData]) => {
+    .then(([modesData, resultsData, poolData]) => {
       if (modesData.error) {
         listEl.textContent = modesData.error;
         return;
       }
       dirsEl.textContent =
-        `parts: ${resultsData.parts_dir || ""}\n` +
-        `vace_full: ${resultsData.vace_full_dir || ""}\n` +
-        `final: ${resultsData.final_path || "(ещё нет)"}`;
+        `пул: ${poolData.ready_dir || ""}\n` +
+        `в пуле: ${poolData.pool_count || 0}\n` +
+        `final: ${poolData.final || "(ещё нет)"}`;
       const byId = {};
       for (const row of resultsData.segments || []) byId[row.seg_id] = row;
-      scenes = (modesData.segments || []).map((s) => ({ ...s, ...(byId[s.seg_id] || {}) }));
+      const poolById = {};
+      for (const row of poolData.segments || []) poolById[row.seg_id] = row;
+      scenes = (modesData.segments || []).map((s) => ({
+        ...s,
+        ...(byId[s.seg_id] || {}),
+        ...(poolById[s.seg_id] || {}),
+      }));
+      const current = Number(node.widgets?.find((w) => w.name === "seg_index")?.value || 0);
+      selected = Math.max(
+        0,
+        scenes.findIndex((s) => s.seg_index === current)
+      );
+      if (selected < 0) selected = 0;
       if (!scenes.length) listEl.textContent = "Нет сцен. Сначала Detect.";
       else render();
     })
@@ -322,15 +279,67 @@ app.registerExtension({
     nodeType.prototype.onNodeCreated = function () {
       const r = onNodeCreated?.apply(this, arguments);
 
-      const legacy = ["Apply SEG → Wan nodes", "Next SEG + Apply", "Queue ALL SEGs → Assemble"];
-      for (const w of this.widgets || []) {
-        if (legacy.includes(w.name)) w.callback = () => openScenes(this);
+      const legacy = ["Apply SEG → Wan nodes", "Next SEG + Apply", "Queue ALL SEGs → Assemble", "Сцены", "Прогон и маска"];
+      for (const w of [...(this.widgets || [])]) {
+        if (legacy.includes(w.name)) {
+          const idx = this.widgets.indexOf(w);
+          if (idx >= 0) this.widgets.splice(idx, 1);
+        }
       }
-      const scenesBtn = (this.widgets || []).find((w) => w.name === "Сцены");
-      if (scenesBtn) scenesBtn.callback = () => openScenes(this);
-      else this.addWidget("button", "Сцены", null, () => openScenes(this));
+
+      this.addWidget("button", "Нарезка", null, () => {
+        const job = this.widgets?.find((w) => w.name === "job_name")?.value || "";
+        if (typeof window.cvfsOpenCut !== "function") {
+          alert("Окно нарезки не загрузилось. Ctrl+F5.");
+          return;
+        }
+        window.cvfsOpenCut({
+          job,
+          onScenes: () => window.cvfsOpenMasters?.({ job }),
+        });
+      });
+      this.addWidget("button", "Мастера", null, () => {
+        const job = this.widgets?.find((w) => w.name === "job_name")?.value || "";
+        if (typeof window.cvfsOpenMasters !== "function") {
+          alert("Окно мастеров не загрузилось. Ctrl+F5.");
+          return;
+        }
+        window.cvfsOpenMasters({ job });
+      });
+      this.addWidget("button", "Работа", null, () => {
+        const job = this.widgets?.find((w) => w.name === "job_name")?.value || "";
+        const pad = this.widgets?.find((w) => w.name === "pad_percent")?.value ?? 20;
+        const segIndex = Number(this.widgets?.find((w) => w.name === "seg_index")?.value || 0);
+        api
+          .fetchApi(`/cvfs/pool?job=${encodeURIComponent(job)}`)
+          .then((r) => r.json())
+          .then((pool) => {
+            const scenes = (pool.segments || []).map((s) => ({
+              seg_index: s.seg_index,
+              seg_id: s.seg_id,
+              frames: s.frames,
+            }));
+            const seg = scenes[segIndex] || { seg_index: segIndex, seg_id: String(segIndex).padStart(2, "0") };
+            if (typeof window.cvfsOpenMatte !== "function") {
+              alert("Окно не загрузилось. Ctrl+F5.");
+              return;
+            }
+            window.cvfsOpenMatte({
+              job,
+              segIndex: seg.seg_index,
+              segId: seg.seg_id,
+              pad,
+              scenes: scenes.length ? scenes : [seg],
+            });
+          })
+          .catch((e) => alert(String(e)));
+      });
+      this.addWidget("button", "Сцены / пул", null, () => openScenes(this));
 
       return r;
     };
   },
 });
+
+// Keep applySegToWanNodes reachable for future canvas wiring.
+window.cvfsApplySegToWanNodes = applySegToWanNodes;

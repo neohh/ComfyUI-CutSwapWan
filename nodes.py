@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import threading
 from pathlib import Path
 
 import folder_paths
@@ -635,6 +636,172 @@ def save_scene_ref_frame(job_name: str, seg_index: int, offset: int) -> dict:
     }
 
 
+def _input_view(path: Path) -> dict | None:
+    if not path.is_file():
+        return None
+    root = Path(folder_paths.get_input_directory())
+    rel = path.resolve().relative_to(root.resolve())
+    return {
+        "filename": rel.name,
+        "subfolder": str(rel.parent).replace("\\", "/"),
+        "type": "input",
+    }
+
+
+def list_master_board(job_name: str) -> dict:
+    """Scene stills next to the saved masters. Both stay on disk across reloads."""
+    board = list_scene_ranges(job_name)
+    job = _job_root(job_name)
+    for row in board["segments"]:
+        sid = row["seg_id"]
+        source = job / "cut_frames" / f"{sid}_REF.png"
+        master = job / "masters" / f"{sid}.png"
+        row["source"] = _input_view(source)
+        row["master"] = _input_view(master)
+        row["master_exists"] = master.is_file()
+    return board
+
+
+def scene_source_file(job_name: str, seg_index: int) -> Path:
+    job = _job_root(job_name)
+    cuts = json.loads((job / "cuts.json").read_text(encoding="utf-8"))
+    seg = (cuts.get("segments") or [])[int(seg_index)]
+    path = job / "cut_frames" / f"{seg['id']}_REF.png"
+    if not path.is_file():
+        start = int(seg["start"])
+        ref = int(seg.get("ref_frame", start))
+        save_scene_ref_frame(job_name, int(seg_index), ref - start)
+    if not path.is_file():
+        raise FileNotFoundError(f"Нет кадра SEG{seg['id']}")
+    return path
+
+
+def masters_sources_zip(job_name: str) -> Path:
+    import zipfile
+
+    board = list_master_board(job_name)
+    job = _job_root(job_name)
+    dest = job / "cut_frames" / "scenes.zip"
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    with zipfile.ZipFile(dest, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+        for row in board["segments"]:
+            src = scene_source_file(job_name, int(row["seg_index"]))
+            zf.write(src, f"SEG{row['seg_id']}.png")
+    return dest
+
+
+def save_master_upload(job_name: str, seg_index: int, data: bytes) -> dict:
+    import cv2
+
+    job = _job_root(job_name)
+    cuts_path = job / "cuts.json"
+    cuts = json.loads(cuts_path.read_text(encoding="utf-8"))
+    segs = cuts.get("segments") or []
+    seg = segs[int(seg_index)]
+    sid = str(seg["id"])
+    frame = cv2.imdecode(np.frombuffer(data, np.uint8), cv2.IMREAD_COLOR)
+    if frame is None:
+        raise RuntimeError("Файл не картинка.")
+    masters = job / "masters"
+    masters.mkdir(parents=True, exist_ok=True)
+    path = masters / f"{sid}.png"
+    cv2.imwrite(str(path), frame)
+    seg["master"] = f"masters/{sid}.png"
+    cuts_path.write_text(json.dumps(cuts, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+    return {"seg_id": sid, "seg_index": int(seg_index), "master": _input_view(path), "saved": True}
+
+
+_DETECT_LOCK = threading.Lock()
+_DETECT_BUSY: set[str] = set()
+
+
+def _detect_progress(job_name: str, **payload) -> None:
+    path = _job_root(job_name) / "detect_progress.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+
+
+def detect_status(job_name: str) -> dict:
+    path = _job_root(job_name) / "detect_progress.json"
+    if not path.is_file():
+        return {"stage": "idle"}
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return {"stage": "idle"}
+
+
+def _read_video_rgb(path: Path) -> tuple[np.ndarray, float]:
+    import cv2
+
+    cap = cv2.VideoCapture(str(path))
+    if not cap.isOpened():
+        raise RuntimeError(f"Не открылось видео: {path.name}")
+    fps = float(cap.get(cv2.CAP_PROP_FPS) or 24.0)
+    frames = []
+    while True:
+        ok, bgr = cap.read()
+        if not ok:
+            break
+        frames.append(cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB))
+    cap.release()
+    if not frames:
+        raise RuntimeError(f"В ролике нет кадров: {path.name}")
+    return np.stack(frames), fps
+
+
+def start_detect_upload(job_name: str, video_path: Path, mask_path: Path) -> dict:
+    """Cut scenes from files the user just picked. No zone switch and no Queue."""
+    job_name = str(job_name or "").strip()
+    if not job_name:
+        raise ValueError("Пустое имя задачи.")
+    with _DETECT_LOCK:
+        if job_name in _DETECT_BUSY:
+            return {"status": "busy", "stage": "cut"}
+        _DETECT_BUSY.add(job_name)
+
+    def work():
+        try:
+            _detect_progress(job_name, stage="read", done=0, total=0, error="", scenes=0)
+            video, fps = _read_video_rgb(video_path)
+            mask, _mask_fps = _read_video_rgb(mask_path)
+            job = _job_root(job_name)
+            job.mkdir(parents=True, exist_ok=True)
+            prev = {}
+            if (job / "job.json").exists():
+                try:
+                    prev = json.loads((job / "job.json").read_text(encoding="utf-8"))
+                except Exception:
+                    prev = {}
+            prev["fps"] = fps
+            (job / "job.json").write_text(json.dumps(prev, indent=2), encoding="utf-8")
+            _detect_progress(job_name, stage="cut", done=0, total=int(video.shape[0]), error="", scenes=0)
+            CVFSDetectSceneCuts().run(
+                _uint8_to_tensor_batch(list(video)),
+                8,
+                0.85,
+                True,
+                True,
+                0.12,
+                0.35,
+                False,
+                True,
+                True,
+                job_name,
+                _uint8_to_tensor_batch(list(mask)),
+            )
+            n = len(list_master_board(job_name).get("segments") or [])
+            _detect_progress(job_name, stage="done", done=n, total=n, error="", scenes=n)
+        except Exception as exc:
+            _detect_progress(job_name, stage="error", done=0, total=0, error=str(exc), scenes=0)
+        finally:
+            with _DETECT_LOCK:
+                _DETECT_BUSY.discard(job_name)
+
+    threading.Thread(target=work, name=f"cvfs-detect-{job_name}", daemon=True).start()
+    return {"status": "started", "job": job_name}
+
+
 def _bake_job_media(
     job_name: str,
     frames_rgb: np.ndarray,
@@ -894,9 +1061,10 @@ FACE_PAD_X_RATIO = 0.55
 # A face column is tall. Below this width/height the 832 fit becomes a slit.
 FACE_MIN_WINDOW_ASPECT = 0.62
 # Face-mode defaults. Mimicry at 1 — eyelid/mouth follow the driver.
-# Relight/colormatch still eased so skin stays nearer the master.
+# Relight LoRA off while we check whether it is the per-frame color drift.
+# Colormatch stays off so skin stays nearer the master.
 FACE_STRENGTH_DEFAULT = 1.0
-FACE_RELIGHT_DEFAULT = 0.5
+FACE_RELIGHT_DEFAULT = 0.0
 FACE_COLORMATCH_DEFAULT = "disabled"
 # Option A test: ReActor-swap master identity onto driver face crops before Wan.
 FACE_PREP_REACTOR_MODEL = "inswapper_128.onnx"
@@ -911,9 +1079,11 @@ FACE_BLOCKS_MAX = 28
 FACE_PREFETCH_SAFE = 1
 WAN_ANIMATE_FP8 = "Wan2_2-Animate-14B_fp8_scaled_e4m3fn_KJ_v2.safetensors"
 WAN_ANIMATE_Q4 = "Wan2_2_Animate_14B_Q4_K_M.gguf"
-# Q4 smoke: smaller window; 16GB still needs heavy blockswap (5080 hangs at swap~6–10).
+# Q4 defaults: 512 smoke; sharp tests use 640 (see wan_sharp / wan_max_side).
 GGUF_WAN_MAX_SIDE = 512
 GGUF_WAN_MAX_PIXELS = 512 * 512
+GGUF_WAN_SHARP_SIDE = 640
+GGUF_WAN_SHARP_PIXELS = 640 * 640
 # Known-good 5080 recipe for stuck Sampling@0%: swap ~40, non_blocking off.
 FACE_BLOCKS_MIN_GGUF = 36
 FACE_BLOCKS_MAX_GGUF = 40
@@ -1339,10 +1509,15 @@ def _prepare_seg_wan_crop(
     x0, y0, x1, y1 = tracks[ref_index]
     cw, ch = x1 - x0, y1 - y0
     if _is_gguf_model(_wan_animate_model_name(seg)):
-        # Q4 smoke / 16GB: keep latent window small so first sample step stays alive.
-        wan_w, wan_h = _wan_fit_size(
-            cw, ch, max_side=GGUF_WAN_MAX_SIDE, max_pixels=GGUF_WAN_MAX_PIXELS
-        )
+        # Q4: default 512 smoke; wan_sharp / wan_max_side raises window for less soft results.
+        max_side = GGUF_WAN_MAX_SIDE
+        max_px = GGUF_WAN_MAX_PIXELS
+        if seg and (seg.get("wan_sharp") or str(seg.get("speed_profile") or "").lower() == "sharp"):
+            max_side, max_px = GGUF_WAN_SHARP_SIDE, GGUF_WAN_SHARP_PIXELS
+        if seg and seg.get("wan_max_side") is not None:
+            max_side = int(seg["wan_max_side"])
+            max_px = max_side * max_side
+        wan_w, wan_h = _wan_fit_size(cw, ch, max_side=max_side, max_pixels=max_px)
     elif _is_fast_profile(seg):
         # Fast test: smaller window only. Block-swap budget is applied later and stays safe.
         wan_w, wan_h = _wan_fit_size(
@@ -2607,7 +2782,10 @@ def _build_seg_workflow(
         if _is_fast_profile(seg):
             tag = "Af"
         elif _is_reactor_prep(prep):
-            tag = "AQ4" if _is_gguf_model(model_name) else "A"
+            if _is_gguf_model(model_name):
+                tag = "AQ4s" if (seg.get("wan_sharp") or str(seg.get("speed_profile") or "").lower() == "sharp") else "AQ4"
+            else:
+                tag = "A"
         else:
             tag = "Q4" if _is_gguf_model(model_name) else ""
         prefix = f"cut_video_face_swapper/{cfg['name']}/preview/{sid}{('_' + tag) if tag else ''}"
@@ -2868,9 +3046,16 @@ def _run_all_segments(
                 seg_run["speed_profile"] = speed
             elif _is_fast_profile(seg_run):
                 seg_run["speed_profile"] = "fast"
-            # Short smoke tests: 6 distill steps is enough to judge Q4 speed/quality.
+            if str(seg_run.get("speed_profile") or "").lower() == "sharp":
+                seg_run["wan_sharp"] = True
+                seg_run.setdefault("wan_max_side", GGUF_WAN_SHARP_SIDE)
+                seg_run.setdefault("wan_steps", 8)
+            # Short tests: default 6 steps; sharp profile uses 8.
             if test_seconds and float(test_seconds) <= 1.0:
-                seg_run.setdefault("wan_steps", 6)
+                if seg_run.get("wan_sharp") or str(seg_run.get("speed_profile") or "").lower() == "sharp":
+                    seg_run.setdefault("wan_steps", 8)
+                else:
+                    seg_run.setdefault("wan_steps", 6)
         if only_missing_wan and not seg_run.get("test_preview") and _seg_has_part(job, job_name, sid):
             # An old Animate part must not block the VACE graph.
             if not (mode == "vace" and not _output_part_is_vace(job_name, sid)):

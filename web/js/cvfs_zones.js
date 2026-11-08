@@ -80,9 +80,9 @@ app.registerExtension({
     const onNodeCreated = nodeType.prototype.onNodeCreated;
     nodeType.prototype.onNodeCreated = function () {
       const r = onNodeCreated?.apply(this, arguments);
-      this.title = this.title?.startsWith("[Z0]")
-        ? this.title
-        : "[Z0] ZONE SELECT — выбери зону, потом Queue";
+      if (!(this.title || "").startsWith("[CTRL]")) {
+        this.title = "[CTRL] Zone — 1 detect / 2 work / 3 assemble";
+      }
       hookZoneSelect(this);
       this.addWidget("button", "Apply zone mutes now", null, () => {
         applyZoneMutes(readZoneFromNode(this));
